@@ -770,29 +770,55 @@ def download_invoices_from_email(year, month):
 
     return classified
 
+def _scan_dir_for_index(directory):
+    """扫描单个目录下所有 PDF 的 hash 和发票号码+金额"""
+    hashes = set()
+    num_amount_pairs = set()
+    if not os.path.exists(directory):
+        return hashes, num_amount_pairs
+    for category in os.listdir(directory):
+        cat_dir = os.path.join(directory, category)
+        if not os.path.isdir(cat_dir):
+            continue
+        for filename in os.listdir(cat_dir):
+            if not filename.lower().endswith('.pdf'):
+                continue
+            fp = os.path.join(cat_dir, filename)
+            try:
+                hashes.add(get_file_hash(fp))
+                info = extract_invoice_info(fp)
+                if info and info.get("invoice_num"):
+                    num_amount_pairs.add((info["invoice_num"], info.get("amount")))
+            except Exception:
+                pass
+    return hashes, num_amount_pairs
+
+
 def _build_existing_hash_index(month_dir):
     """扫描月份目录下所有已有 PDF 的 hash 和发票号码+金额，返回 (hashes, num_amount_pairs)"""
     hashes = set()
     num_amount_pairs = set()
     for subdir in ["未使用", "已使用"]:
-        base = os.path.join(month_dir, subdir)
-        if not os.path.exists(base):
+        h, p = _scan_dir_for_index(os.path.join(month_dir, subdir))
+        hashes.update(h)
+        num_amount_pairs.update(p)
+    return hashes, num_amount_pairs
+
+
+def _build_global_used_index():
+    """扫描所有月份的已使用目录，返回 (hashes, num_amount_pairs)"""
+    hashes = set()
+    num_amount_pairs = set()
+    if not os.path.exists(INVOICE_BASE_DIR):
+        return hashes, num_amount_pairs
+    for month_name in os.listdir(INVOICE_BASE_DIR):
+        month_dir = os.path.join(INVOICE_BASE_DIR, month_name)
+        if not os.path.isdir(month_dir):
             continue
-        for category in os.listdir(base):
-            cat_dir = os.path.join(base, category)
-            if not os.path.isdir(cat_dir):
-                continue
-            for filename in os.listdir(cat_dir):
-                if not filename.lower().endswith('.pdf'):
-                    continue
-                fp = os.path.join(cat_dir, filename)
-                try:
-                    hashes.add(get_file_hash(fp))
-                    info = extract_invoice_info(fp)
-                    if info and info.get("invoice_num"):
-                        num_amount_pairs.add((info["invoice_num"], info.get("amount")))
-                except Exception:
-                    pass
+        used_dir = os.path.join(month_dir, "已使用")
+        h, p = _scan_dir_for_index(used_dir)
+        hashes.update(h)
+        num_amount_pairs.update(p)
     return hashes, num_amount_pairs
 
 def classify_and_store_by_invoice_date(file_list):
@@ -801,6 +827,11 @@ def classify_and_store_by_invoice_date(file_list):
 
     classified = []
     used_num_amount_pairs, used_file_hashes = get_used_invoice_set()
+
+    # 合并全局已使用目录的文件系统索引作为兜底（防止 batch 记录缺失或已取消）
+    global_used_hashes, global_used_pairs = _build_global_used_index()
+    used_file_hashes.update(global_used_hashes)
+    used_num_amount_pairs.update(global_used_pairs)
 
     # 预构建各月份已有文件的 hash 索引，避免 O(n^2)
     month_hash_cache = {}
@@ -1054,7 +1085,13 @@ def select_invoices_for_reimbursement():
     log("开始筛选报销发票...")
 
     months = get_invoice_quarter()
-    used_set = get_used_invoice_set()
+    used_num_amount_pairs, used_file_hashes = get_used_invoice_set()
+
+    # 合并全局已使用目录的文件系统索引作为兜底
+    global_used_hashes, global_used_pairs = _build_global_used_index()
+    used_file_hashes.update(global_used_hashes)
+    used_num_amount_pairs.update(global_used_pairs)
+    used_set = (used_num_amount_pairs, used_file_hashes)
 
     # 按月份、类别收集发票
     month_invoices = {}
@@ -1150,6 +1187,17 @@ def select_invoices_for_reimbursement():
         total = sum(inv["amount"] for inv in selected_inv)
         result[category] = selected_inv
         log(f"  => {category} 最终: {len(selected_inv)} 张，合计 ¥{total:.2f} (阈值 ¥{threshold})")
+
+    # 汇总每个分类未使用发票总金额
+    log("--- 各分类未使用发票汇总 ---")
+    all_unused_by_cat = {}
+    for (y, m), cat_map in month_invoices.items():
+        for cat, invs in cat_map.items():
+            all_unused_by_cat.setdefault(cat, []).extend(invs)
+    for cat in THRESHOLDS:
+        all_invs = all_unused_by_cat.get(cat, [])
+        total_unused = sum(inv.get("amount") or 0 for inv in all_invs)
+        log(f"  {cat}: {len(all_invs)} 张未使用，总金额 ¥{total_unused:.2f}")
 
     return result, months
 
