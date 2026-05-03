@@ -150,6 +150,16 @@ def safe_filename(name):
     """将文件名中的不安全字符替换为下划线"""
     return "".join(c if is_safe_char(c) else "_" for c in name)
 
+def generate_invoice_filename(info, ext=".pdf"):
+    """生成标准化发票文件名：分类_发票号码_开票金额_开票日期"""
+    category = info.get("category") or "其他"
+    invoice_num = info.get("invoice_num") or "unknown"
+    amount = info.get("amount")
+    amount_str = f"{amount:.2f}" if amount is not None else "0.00"
+    date = info.get("date")
+    date_str = date.strftime("%Y%m%d") if date else "nodate"
+    return safe_filename(f"{category}_{invoice_num}_{amount_str}_{date_str}") + ext
+
 # ==================== Batch 管理 ====================
 
 def load_batches():
@@ -184,10 +194,19 @@ def save_batches(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, BATCH_FILE)
 
+def is_invoice_seen(invoice_num, amount, seen_pairs):
+    """判断发票是否已在集合中（按发票号码+金额比对）"""
+    if not invoice_num:
+        return False
+    if amount is not None and (invoice_num, amount) in seen_pairs:
+        return True
+    # amount 提取失败时，仅匹配发票号码
+    return any(num == invoice_num for num, _ in seen_pairs)
+
 def get_used_invoice_set():
-    """获取所有未取消 batch 中已使用的发票集合（invoice_nums, file_hashes）"""
+    """获取所有未取消 batch 中已使用的发票集合（num_amount_pairs, file_hashes）"""
     data = load_batches()
-    invoice_nums = set()
+    num_amount_pairs = set()
     file_hashes = set()
     for batch in data["batches"]:
         if batch["status"] == "cancelled":
@@ -195,12 +214,13 @@ def get_used_invoice_set():
         for cat, inv_list in batch.get("selected", {}).items():
             for inv in inv_list:
                 num = inv.get("invoice_num")
+                amt = inv.get("amount")
                 h = inv.get("file_hash")
                 if num:
-                    invoice_nums.add(num)
+                    num_amount_pairs.add((num, amt))
                 if h:
                     file_hashes.add(h)
-    return invoice_nums, file_hashes
+    return num_amount_pairs, file_hashes
 
 def add_batch(window, selected):
     """创建新 batch 记录，返回 batch_id"""
@@ -403,21 +423,36 @@ def extract_invoice_info(filepath):
         if not is_valid_invoice(text):
             return None
         
-        # 提取发票号码
-        patterns = [
-            r'发票号码[：:]\s*[‖|]?\s*(\d{20})',
-            r'发票号码[：:]\s*[‖|]?\s*(\d+)',
+        # 统一清理空白，便于跨行匹配
+        clean_text = re.sub(r'\s+', ' ', text)
+
+        # 提取发票号码（多种格式兼容）
+        num_patterns = [
+            r'发\s*票\s*号\s*码[：:]*\s*[‖|]?\s*(\d{20})',
+            r'发\s*票\s*号\s*码[：:]*\s*[‖|]?\s*(\d{8,})',
+            r'Invoice\s*No[.：:]*\s*(\d{20})',
         ]
         invoice_num = None
-        for pattern in patterns:
-            match = re.search(pattern, text)
+        for pattern in num_patterns:
+            match = re.search(pattern, clean_text)
             if match:
                 invoice_num = match.group(1)
                 break
-        
+
+        # 兜底1：文本中找20位数字串作为发票号码（全电发票）
+        if not invoice_num:
+            all_20digit = re.findall(r'(?<!\d)(\d{20})(?!\d)', clean_text)
+            if all_20digit:
+                invoice_num = all_20digit[0]
+
+        # 兜底2：老版发票号码为8位，通常紧跟在10-12位发票代码后面
+        if not invoice_num:
+            m = re.search(r'(?<!\d)(\d{10,12})\s+(\d{8})(?!\d)', clean_text)
+            if m:
+                invoice_num = m.group(2)
+
         # 提取金额
         amount = None
-        clean_text = re.sub(r'\s+', ' ', text)
         
         amount_patterns = [
             r'价税合计[（(]小写[)）][：:]?\s*[¥￥]?\s*([\d,]+\.?\d*)',
@@ -736,9 +771,9 @@ def download_invoices_from_email(year, month):
     return classified
 
 def _build_existing_hash_index(month_dir):
-    """扫描月份目录下所有已有 PDF 的 hash 和发票号码，返回 (hashes, invoice_nums)"""
+    """扫描月份目录下所有已有 PDF 的 hash 和发票号码+金额，返回 (hashes, num_amount_pairs)"""
     hashes = set()
-    invoice_nums = set()
+    num_amount_pairs = set()
     for subdir in ["未使用", "已使用"]:
         base = os.path.join(month_dir, subdir)
         if not os.path.exists(base):
@@ -755,17 +790,17 @@ def _build_existing_hash_index(month_dir):
                     hashes.add(get_file_hash(fp))
                     info = extract_invoice_info(fp)
                     if info and info.get("invoice_num"):
-                        invoice_nums.add(info["invoice_num"])
+                        num_amount_pairs.add((info["invoice_num"], info.get("amount")))
                 except Exception:
                     pass
-    return hashes, invoice_nums
+    return hashes, num_amount_pairs
 
 def classify_and_store_by_invoice_date(file_list):
     """根据发票实际开票日期分类存放，跨次全局去重"""
     log("根据发票开票日期分类存放...")
 
     classified = []
-    used_invoice_nums, used_file_hashes = get_used_invoice_set()
+    used_num_amount_pairs, used_file_hashes = get_used_invoice_set()
 
     # 预构建各月份已有文件的 hash 索引，避免 O(n^2)
     month_hash_cache = {}
@@ -788,9 +823,10 @@ def classify_and_store_by_invoice_date(file_list):
                 os.remove(filepath)
                 continue
 
-            # 检查发票号码是否已在已用集合中
+            # 检查发票号码+金额是否已在已用集合中
             invoice_num = info.get("invoice_num")
-            if invoice_num and invoice_num in used_invoice_nums:
+            amount = info.get("amount")
+            if is_invoice_seen(invoice_num, amount, used_num_amount_pairs):
                 log(f"  发票已使用，跳过: {os.path.basename(filepath)} (号码: {invoice_num})")
                 os.remove(filepath)
                 continue
@@ -807,16 +843,16 @@ def classify_and_store_by_invoice_date(file_list):
                 year, month = datetime.now().year, datetime.now().month
                 month_dir = os.path.join(INVOICE_BASE_DIR, f"{year}-{month:02d}")
 
-            # 用缓存查 hash + 发票号码去重
+            # 用缓存查 hash + 发票号码+金额去重
             month_key = f"{year}-{month:02d}"
             if month_key not in month_hash_cache:
                 month_hash_cache[month_key] = _build_existing_hash_index(month_dir)
-            existing_hashes, existing_nums = month_hash_cache[month_key]
+            existing_hashes, existing_num_amounts = month_hash_cache[month_key]
             if file_hash in existing_hashes:
                 log(f"  文件已存在，跳过: {os.path.basename(filepath)}")
                 os.remove(filepath)
                 continue
-            if invoice_num and invoice_num in existing_nums:
+            if is_invoice_seen(invoice_num, amount, existing_num_amounts):
                 log(f"  发票号码已存在，跳过: {os.path.basename(filepath)} (号码: {invoice_num})")
                 os.remove(filepath)
                 continue
@@ -825,12 +861,14 @@ def classify_and_store_by_invoice_date(file_list):
             unused_dir = os.path.join(month_dir, "未使用", category)
             os.makedirs(unused_dir, exist_ok=True)
 
-            # 移动文件到未使用目录
-            dest_path = os.path.join(unused_dir, os.path.basename(filepath))
+            # 使用标准化文件名移动到未使用目录
+            _, src_ext = os.path.splitext(filepath)
+            new_name = generate_invoice_filename(info, src_ext)
+            dest_path = os.path.join(unused_dir, new_name)
 
             counter = 1
             while os.path.exists(dest_path):
-                base, ext = os.path.splitext(os.path.basename(filepath))
+                base, ext = os.path.splitext(new_name)
                 dest_path = os.path.join(unused_dir, f"{base}_{counter}{ext}")
                 counter += 1
 
@@ -842,7 +880,7 @@ def classify_and_store_by_invoice_date(file_list):
             # 更新缓存
             existing_hashes.add(file_hash)
             if invoice_num:
-                existing_nums.add(invoice_num)
+                existing_num_amounts.add((invoice_num, amount))
 
             log(f"  [{category}] {os.path.basename(dest_path)} -> {year}-{month:02d}")
 
@@ -875,30 +913,31 @@ def process_invoices(classified_invoices):
         
         # 处理该月份的发票
         seen_hashes = {}
-        seen_numbers = {}
+        seen_pairs = set()
 
         for inv in invoices:
             filepath = inv.get("filepath", "")
             if not os.path.exists(filepath):
                 continue
-            
+
             # 检查文件哈希
             file_hash = get_file_hash(filepath)
             if file_hash in seen_hashes:
                 log(f"  重复文件，删除: {os.path.basename(filepath)}")
                 os.remove(filepath)
                 continue
-            
-            # 检查发票号码
+
+            # 检查发票号码+金额
             invoice_num = inv.get("invoice_num")
-            if invoice_num and invoice_num in seen_numbers:
+            amount = inv.get("amount")
+            if is_invoice_seen(invoice_num, amount, seen_pairs):
                 log(f"  重复发票，删除: {os.path.basename(filepath)}")
                 os.remove(filepath)
                 continue
-            
+
             seen_hashes[file_hash] = filepath
             if invoice_num:
-                seen_numbers[invoice_num] = filepath
+                seen_pairs.add((invoice_num, amount))
             
             processed.append(inv)
             log(f"  [{inv.get('category')}] {os.path.basename(filepath)} - ¥{inv.get('amount') or '?'}")
@@ -918,7 +957,7 @@ def scan_invoices_from_directory(month_dir, used_set=None):
     if used_set is None:
         used_set = (set(), set())
 
-    used_invoice_nums, used_file_hashes = used_set
+    used_num_amount_pairs, used_file_hashes = used_set
     invoices = []
 
     for category in ["餐饮", "交通", "通信", "其他"]:
@@ -944,8 +983,8 @@ def scan_invoices_from_directory(month_dir, used_set=None):
             if not info:
                 continue
 
-            # 按发票号码排除
-            if info.get("invoice_num") and info["invoice_num"] in used_invoice_nums:
+            # 按发票号码+金额排除
+            if is_invoice_seen(info.get("invoice_num"), info.get("amount"), used_num_amount_pairs):
                 continue
 
             info["file_hash"] = file_hash
@@ -1210,6 +1249,151 @@ def reorganize_month(month_str):
 
     log(f"整理完成: 移动 {moved} 张，跳过 {skipped} 张，失败 {failed} 张")
 
+def rename_existing_invoices():
+    """扫描所有历史发票文件，重命名为标准化格式，并更新 batches.json 路径"""
+    log("扫描并重命名历史发票文件...")
+
+    path_mapping = {}  # 旧路径 -> 新路径
+    renamed = 0
+    skipped = 0
+    failed = 0
+
+    if not os.path.exists(INVOICE_BASE_DIR):
+        log("发票目录不存在")
+        return
+
+    for month_name in os.listdir(INVOICE_BASE_DIR):
+        month_dir = os.path.join(INVOICE_BASE_DIR, month_name)
+        if not re.match(r'^\d{4}-\d{2}$', month_name) or not os.path.isdir(month_dir):
+            continue
+
+        for subdir in ["未使用", "已使用"]:
+            status_dir = os.path.join(month_dir, subdir)
+            if not os.path.exists(status_dir):
+                continue
+
+            for category in os.listdir(status_dir):
+                cat_dir = os.path.join(status_dir, category)
+                if not os.path.isdir(cat_dir):
+                    continue
+
+                for filename in os.listdir(cat_dir):
+                    if not filename.lower().endswith('.pdf'):
+                        continue
+
+                    src_path = os.path.join(cat_dir, filename)
+                    try:
+                        info = extract_invoice_info(src_path)
+                        if not info:
+                            skipped += 1
+                            continue
+
+                        _, ext = os.path.splitext(filename)
+                        new_name = generate_invoice_filename(info, ext)
+
+                        if new_name == filename:
+                            skipped += 1
+                            continue
+
+                        new_path = os.path.join(cat_dir, new_name)
+                        counter = 1
+                        while os.path.exists(new_path) and new_path != src_path:
+                            base, e = os.path.splitext(new_name)
+                            new_path = os.path.join(cat_dir, f"{base}_{counter}{e}")
+                            counter += 1
+
+                        if new_path == src_path:
+                            skipped += 1
+                            continue
+
+                        os.rename(src_path, new_path)
+                        path_mapping[src_path] = new_path
+                        renamed += 1
+                        log(f"  重命名: {filename} -> {new_name}")
+                    except Exception as e:
+                        failed += 1
+                        log(f"  重命名失败: {filename} - {e}")
+
+    # 更新 batches.json 中的路径和发票号码（按 file_hash 匹配）
+    _update_batch_records_by_hash()
+
+    log(f"重命名完成: {renamed} 张已重命名，{skipped} 张跳过，{failed} 张失败")
+
+def _update_batch_records_by_hash():
+    """扫描磁盘文件，按 file_hash 更新 batches.json 中的路径和发票号码"""
+    # 构建全局 hash 索引：file_hash -> 绝对路径
+    hash_to_path = {}
+    if not os.path.exists(INVOICE_BASE_DIR):
+        return
+    for month_name in os.listdir(INVOICE_BASE_DIR):
+        month_dir = os.path.join(INVOICE_BASE_DIR, month_name)
+        if not re.match(r'^\d{4}-\d{2}$', month_name) or not os.path.isdir(month_dir):
+            continue
+        for subdir in ["未使用", "已使用"]:
+            status_dir = os.path.join(month_dir, subdir)
+            if not os.path.exists(status_dir):
+                continue
+            for category in os.listdir(status_dir):
+                cat_dir = os.path.join(status_dir, category)
+                if not os.path.isdir(cat_dir):
+                    continue
+                for filename in os.listdir(cat_dir):
+                    if not filename.lower().endswith('.pdf'):
+                        continue
+                    fp = os.path.join(cat_dir, filename)
+                    try:
+                        h = get_file_hash(fp)
+                        hash_to_path[h] = fp
+                    except Exception:
+                        pass
+
+    data = load_batches()
+    updated = 0
+    for batch in data.get("batches", []):
+        for cat, inv_list in batch.get("selected", {}).items():
+            for inv in inv_list:
+                target_hash = inv.get("file_hash", "")
+                if not target_hash or target_hash not in hash_to_path:
+                    continue
+                current_path = hash_to_path[target_hash]
+                # 判断文件当前在未使用还是已使用
+                if "已使用" in current_path:
+                    old_dp = inv.get("dest_path", "")
+                    if old_dp != current_path:
+                        inv["dest_path"] = current_path
+                        updated += 1
+                    # filepath 应该是对应的未使用路径（将 已使用 替换为 未使用）
+                    expected_fp = current_path.replace("已使用", "未使用")
+                    old_fp = inv.get("filepath", "")
+                    if old_fp != expected_fp:
+                        inv["filepath"] = expected_fp
+                        updated += 1
+                else:
+                    old_fp = inv.get("filepath", "")
+                    if old_fp != current_path:
+                        inv["filepath"] = current_path
+                        updated += 1
+                    # dest_path 应该是对应的已使用路径（将 未使用 替换为 已使用）
+                    expected_dp = current_path.replace("未使用", "已使用")
+                    old_dp = inv.get("dest_path", "")
+                    if old_dp != expected_dp:
+                        inv["dest_path"] = expected_dp
+                        updated += 1
+
+                # 补全发票号码（如果之前是 null）
+                if not inv.get("invoice_num") and os.path.exists(current_path):
+                    try:
+                        info = extract_invoice_info(current_path)
+                        if info and info.get("invoice_num"):
+                            inv["invoice_num"] = info["invoice_num"]
+                            updated += 1
+                    except Exception:
+                        pass
+
+    if updated > 0:
+        save_batches(data)
+        log(f"已更新 batches.json 中 {updated} 条记录")
+
 # ==================== 打包 ====================
 
 def pack_and_save(invoices_by_category, batch_id=None):
@@ -1278,6 +1462,7 @@ USAGE = """\
   python3 invoice_automation_v4.py --force-cancel ID      强制取消已取消的批次，重新恢复发票
   python3 invoice_automation_v4.py --resend ID            重新打包发送指定批次的发票
   python3 invoice_automation_v4.py --reorganize YYYY-MM   将指定月份未使用发票按实际开票日期重新归档
+  python3 invoice_automation_v4.py --rename-existing     扫描所有历史发票，重命名为标准化格式并更新batches.json
 
 完整流程说明:
   1. 从QQ邮箱下载上月收到的发票邮件，按发票开票日期分类存放
@@ -1307,6 +1492,8 @@ def parse_args():
                         help="重新打包发送指定批次的发票（不改变批次状态）")
     parser.add_argument("--reorganize", metavar="YYYY-MM",
                         help="扫描指定月份的未使用发票，按发票实际开票日期移动到正确月份目录")
+    parser.add_argument("--rename-existing", action="store_true",
+                        help="扫描所有历史发票文件，重命名为标准化格式并更新batches.json路径")
     return parser.parse_args()
 
 # ==================== 主流程 ====================
@@ -1328,6 +1515,9 @@ def main():
         return
     if args.reorganize:
         reorganize_month(args.reorganize)
+        return
+    if args.rename_existing:
+        rename_existing_invoices()
         return
 
     log("="*60)
